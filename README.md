@@ -39,6 +39,8 @@ skydun deploy        # upload and deploy
 
 Press Ctrl-C while the build log streams to stop following: the deployment keeps running on the server.
 
+`skydun deploy` exits 0 once the deployment succeeds, 1 when it fails or the panel could not be followed to the end (the deployment keeps running), and 2 for a usage error such as an option it does not know.
+
 ## skydun.json
 
 `skydun link` writes it to the project root. Commit it so everyone deploys to the same website.
@@ -53,11 +55,11 @@ Press Ctrl-C while the build log streams to stop following: the deployment keeps
 
 - `site`: the website's uuid.
 - `type`: `laravel`, `nextjs` or `html`.
-- `directory`: HTML websites only. The ready-built folder to upload, such as `dist`. Leave it out, or set `.`, to upload the source and build on the server.
+- `directory`: HTML websites only. The ready-built folder to upload, such as `dist`. Leave it out, or set it to the project folder itself, to upload the source and build on the server.
 
 ## What gets uploaded
 
-Each kind of website leaves out what the server builds again and what stays secret on the server. Your `.gitignore` and a `.skydunignore` (same syntax) are applied on top; a `!pattern` in `.skydunignore` takes back a path `.gitignore` leaves out. `.git` is never uploaded.
+Each kind of website leaves out what the server builds again and what stays secret on the server. Your `.gitignore` files, nested ones included, and a `.skydunignore` (same syntax, in the project root) are applied on top; a `!pattern` in `.skydunignore` takes back a path a `.gitignore` leaves out. `.git` is never uploaded.
 
 | Type    | Uploads                                                                      | Leaves out                                                                                                                                                         | On the server                                                                                                                            |
 | ------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
@@ -93,6 +95,7 @@ git clone git@github.com:skydunlabs/skydun-cli.git
 cd skydun-cli
 npm ci
 npm test
+npm run format
 node bin/skydun.js --help
 ```
 

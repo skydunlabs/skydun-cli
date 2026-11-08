@@ -25,7 +25,9 @@ test('the saved login is private to the user and read back', async () => {
         configPath(vars),
         join(vars.XDG_CONFIG_HOME, 'skydun', 'config.json'),
     );
-    assert.equal((await stat(configPath(vars))).mode & 0o777, 0o600);
+    if (process.platform !== 'win32') {
+        assert.equal((await stat(configPath(vars))).mode & 0o777, 0o600);
+    }
     assert.deepEqual(await loadConfig(vars), {
         url: 'https://panel.test',
         token: 'saved',

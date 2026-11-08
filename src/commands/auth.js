@@ -17,7 +17,8 @@ Options:
   --url <panel>  The panel's address, such as https://panel.example.com`;
 
 export async function login({ options }) {
-    const saved = await readSavedConfig();
+    // A saved login that cannot be read is replaced by this one.
+    const saved = await readSavedConfig().catch(() => ({}));
     const url = normalizeUrl(
         options.url || (await ask('Panel URL', saved.url ?? '')),
     );
@@ -58,10 +59,10 @@ export const whoamiHelp = `Usage: skydun whoami
 Show who the saved token (or SKYDUN_TOKEN) logs in as.`;
 
 export async function whoami() {
-    const user = await createClient(await requireLogin()).user();
-    const { url } = await loadConfig();
+    const config = await requireLogin();
+    const user = await createClient(config).user();
 
-    console.log(`${user.name} (${user.email}) on ${url}`);
+    console.log(`${user.name} (${user.email}) on ${config.url}`);
 }
 
 export async function requireLogin() {

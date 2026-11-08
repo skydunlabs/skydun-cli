@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,14 +11,36 @@ import {
     friendlyMessage,
 } from '../src/api.js';
 import { main } from '../src/cli.js';
+import { packArchive } from '../src/pack.js';
 import { fixture } from './helpers.js';
 
 const OUTPUT =
     '==> Creating release\n==> Running deploy script\n==> Deployed release\n';
+const SITES = [
+    {
+        uuid: 'site-1',
+        name: 'Shop',
+        domain: 'shop.test',
+        type: 'html',
+        workspace: { slug: 'acme', name: 'Acme' },
+        url: 'https://panel/sites/shop',
+    },
+    {
+        uuid: 'site-2',
+        name: 'Blog',
+        domain: null,
+        type: 'nextjs',
+        workspace: { slug: 'acme', name: 'Acme' },
+        url: 'https://panel/sites/blog',
+    },
+];
 let server;
 let url;
 let uploads = [];
 let polls = [];
+/** Statuses the next polls answer with before serving normally. */
+let failNext = [];
+const savedEnv = {};
 
 before(async () => {
     server = http.createServer((req, res) => {
@@ -26,6 +48,12 @@ before(async () => {
             res.writeHead(status, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(body));
         };
+
+        if (req.headers.authorization === 'Bearer html') {
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+
+            return res.end('<html><body>Sign in</body></html>');
+        }
 
         if (req.headers.authorization !== 'Bearer good') {
             return json(401, { message: 'Unauthenticated.' });
@@ -38,18 +66,7 @@ before(async () => {
         }
 
         if (path.pathname === '/api/v1/sites') {
-            return json(200, {
-                data: [
-                    {
-                        uuid: 'site-1',
-                        name: 'Shop',
-                        domain: 'shop.test',
-                        type: 'html',
-                        workspace: { slug: 'acme', name: 'Acme' },
-                        url: 'https://panel/sites/shop',
-                    },
-                ],
-            });
+            return json(200, { data: SITES });
         }
 
         if (
@@ -89,6 +106,12 @@ before(async () => {
         }
 
         if (path.pathname === '/api/v1/sites/site-1/deployments/dep-1') {
+            if (failNext.length > 0) {
+                return json(failNext.shift(), {
+                    message: 'The panel is busy.',
+                });
+            }
+
             // Output arrives in three steps; the client must pass back each offset.
             const offset = Number(path.searchParams.get('offset'));
             polls.push(offset);
@@ -110,9 +133,55 @@ before(async () => {
 
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     url = `http://127.0.0.1:${server.address().port}`;
+
+    for (const name of ['SKYDUN_URL', 'SKYDUN_TOKEN', 'XDG_CONFIG_HOME']) {
+        savedEnv[name] = process.env[name];
+    }
+
+    process.env.SKYDUN_URL = url;
+    process.env.SKYDUN_TOKEN = 'good';
+    process.env.XDG_CONFIG_HOME = await mkdtemp(join(tmpdir(), 'skydun-cfg-'));
 });
 
-after(() => server.close());
+after(() => {
+    server.close();
+
+    for (const [name, value] of Object.entries(savedEnv)) {
+        if (value === undefined) {
+            delete process.env[name];
+        } else {
+            process.env[name] = value;
+        }
+    }
+});
+
+/** Run the CLI with what it prints captured. */
+async function run(argv, context) {
+    const out = [];
+    const err = [];
+    const write = process.stdout.write;
+    const log = console.log;
+    const error = console.error;
+    // The test runner itself writes Buffers here; only the CLI writes strings.
+    process.stdout.write = (chunk, ...rest) =>
+        typeof chunk === 'string'
+            ? (out.push(chunk), true)
+            : write.call(process.stdout, chunk, ...rest);
+    console.log = (...parts) => out.push(parts.join(' ') + '\n');
+    console.error = (...parts) => err.push(parts.join(' ') + '\n');
+
+    try {
+        return {
+            code: await main(argv, context),
+            out: out.join(''),
+            err: err.join(''),
+        };
+    } finally {
+        process.stdout.write = write;
+        console.log = log;
+        console.error = error;
+    }
+}
 
 test('following a deployment passes back each offset and prints the output once', async () => {
     polls = [];
@@ -133,6 +202,37 @@ test('following a deployment passes back each offset and prints the output once'
         polls,
         Array.from({ length: Math.ceil(OUTPUT.length / 25) }, (_, i) => i * 25),
     );
+});
+
+test('a poll that fails because the panel is busy or down is tried again', async () => {
+    const client = createClient({ url, token: 'good' });
+    polls = [];
+    failNext = [502, 429];
+    let printed = '';
+    const finished = await followDeployment(client, 'site-1', 'dep-1', {
+        intervalMs: 1,
+        onOutput: (chunk) => (printed += chunk),
+    });
+
+    assert.equal(finished.status, 'succeeded');
+    assert.equal(printed, OUTPUT);
+    assert.deepEqual(failNext, []);
+
+    polls = [];
+    failNext = [503, 503, 503];
+    const givenUp = await followDeployment(client, 'site-1', 'dep-1', {
+        intervalMs: 1,
+        retries: 2,
+    }).catch((e) => e);
+
+    assert.equal(givenUp.status, 503);
+    assert.deepEqual(failNext, []);
+
+    const missing = await followDeployment(client, 'site-1', 'dep-9', {
+        intervalMs: 1,
+    }).catch((e) => e);
+
+    assert.equal(missing.status, 404);
 });
 
 test('a refused token sends people to login, other errors show the panel message', async () => {
@@ -164,6 +264,15 @@ test('a refused token sends people to login, other errors show the panel message
         ),
         'The archive field is required.\n  Too long.',
     );
+
+    const page = await createClient({ url, token: 'html' })
+        .user()
+        .catch((e) => e);
+    assert.ok(page instanceof ApiError);
+    assert.match(
+        friendlyMessage(page),
+        /answered 200 with something that is not JSON/,
+    );
 });
 
 test('skydun deploy uploads a prebuilt HTML folder as multipart and follows the build', async () => {
@@ -179,27 +288,13 @@ test('skydun deploy uploads a prebuilt HTML folder as multipart and follows the 
         'src/main.js': '',
     });
 
-    process.env.SKYDUN_URL = url;
-    process.env.SKYDUN_TOKEN = 'good';
-    process.env.XDG_CONFIG_HOME = await mkdtemp(join(tmpdir(), 'skydun-cfg-'));
-    process.chdir(project);
-
-    const lines = [];
-    const write = process.stdout.write.bind(process.stdout);
-    const log = console.log;
-    process.stdout.write = (chunk) => (lines.push(String(chunk)), true);
-    console.log = (...parts) => lines.push(parts.join(' ') + '\n');
-
-    let code;
-
-    try {
-        code = await main(['deploy', '--message', 'Launch']);
-    } finally {
-        process.stdout.write = write;
-        console.log = log;
-    }
+    const { code, out } = await run(['deploy', '--message', 'Launch'], {
+        cwd: project,
+        pollIntervalMs: 1,
+    });
 
     const upload = uploads[0];
+    assert.ok(upload, 'the archive was uploaded');
     const body = upload.body.toString('latin1');
 
     assert.equal(code, 0);
@@ -215,13 +310,40 @@ test('skydun deploy uploads a prebuilt HTML folder as multipart and follows the 
             'name="archive"; filename="source.tar.gz"\r\nContent-Type: application/gzip\r\n\r\n\u001f\u008b',
         ),
     );
-    assert.ok(lines.join('').includes(OUTPUT));
-    assert.ok(lines.join('').includes('Deployed.'));
+    assert.match(out, /Packed 1 files/);
+    assert.match(out, /Uploading/);
+    assert.ok(out.includes(OUTPUT));
+    assert.ok(out.includes('Deployed.'));
+});
+
+test('skydun link --site writes skydun.json without asking', async () => {
+    const project = await fixture({ 'package.json': '{}' });
+    const { code, out } = await run(['link', '--site', 'site-2'], {
+        cwd: project,
+    });
+
+    assert.equal(code, 0);
+    assert.match(out, /Linked to Blog/);
+    assert.deepEqual(
+        JSON.parse(await readFile(join(project, 'skydun.json'), 'utf8')),
+        { site: 'site-2', type: 'nextjs' },
+    );
+
+    const { code: refused, err } = await run(['link', '--site', 'site-9'], {
+        cwd: project,
+    });
+    assert.equal(refused, 1);
+    assert.match(err, /No website you may deploy has the uuid site-9/);
+});
+
+test('skydun whoami shows the token owner and the panel', async () => {
+    const { code, out } = await run(['whoami']);
+
+    assert.equal(code, 0);
+    assert.equal(out, `Ada (ada@example.test) on ${url}\n`);
 });
 
 async function fixtureArchive() {
-    const { packArchive } = await import('../src/pack.js');
-
     return (await packArchive(await fixture({ 'index.html': '' }), 'html'))
         .path;
 }

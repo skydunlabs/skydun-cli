@@ -5,13 +5,28 @@ import http from 'node:http';
 import https from 'node:https';
 import { basename } from 'node:path';
 
+/** How long a request may take before the panel counts as unreachable. */
+const REQUEST_TIMEOUT_MS = 30_000;
+
+/** The statuses a deployment is still being worked on in. */
+const IN_PROGRESS = new Set(['pending', 'running']);
+
+/** The panel answered, but refused. */
 export class ApiError extends Error {
     constructor(status, message, errors = null) {
         super(message);
         this.status = status;
         this.errors = errors;
     }
+
+    /** Whether a later try may well succeed: the panel was busy or down. */
+    get transient() {
+        return this.status === 408 || this.status === 429 || this.status >= 500;
+    }
 }
+
+/** The panel could not be reached, or did not answer in time. */
+export class NetworkError extends Error {}
 
 /**
  * The message to show for a failed request: a refused token sends people
@@ -19,7 +34,7 @@ export class ApiError extends Error {
  */
 export function friendlyMessage(error) {
     if (!(error instanceof ApiError)) {
-        return error.message;
+        return error?.message ?? String(error);
     }
 
     if (error.status === 401) {
@@ -38,7 +53,7 @@ export function friendlyMessage(error) {
         : message;
 }
 
-async function toApiError(status, text) {
+function toApiError(status, text) {
     let body = null;
 
     try {
@@ -62,6 +77,31 @@ async function toApiError(status, text) {
     );
 }
 
+/** The JSON a successful response holds, or null for an empty one. */
+function parseJson(text, status) {
+    if (text === '') {
+        return null;
+    }
+
+    try {
+        return JSON.parse(text);
+    } catch {
+        throw new ApiError(
+            status,
+            `The panel answered ${status} with something that is not JSON. Is the panel address right?`,
+        );
+    }
+}
+
+function unreachable(url, error) {
+    const reason =
+        error.name === 'TimeoutError'
+            ? `no answer in ${REQUEST_TIMEOUT_MS / 1000} seconds`
+            : (error.cause?.message ?? error.message);
+
+    return new NetworkError(`Could not reach ${url}: ${reason}`);
+}
+
 export function createClient({ url, token }) {
     const base = `${url}/api/v1`;
     const headers = {
@@ -72,22 +112,24 @@ export function createClient({ url, token }) {
 
     async function request(method, path) {
         let response;
+        let text;
 
         try {
-            response = await fetch(`${base}${path}`, { method, headers });
+            response = await fetch(`${base}${path}`, {
+                method,
+                headers,
+                signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+            });
+            text = await response.text();
         } catch (error) {
-            throw new Error(
-                `Could not reach ${url}: ${error.cause?.message ?? error.message}`,
-            );
+            throw unreachable(url, error);
         }
-
-        const text = await response.text();
 
         if (!response.ok) {
-            throw await toApiError(response.status, text);
+            throw toApiError(response.status, text);
         }
 
-        return text === '' ? null : JSON.parse(text);
+        return parseJson(text, response.status);
     }
 
     return {
@@ -140,6 +182,7 @@ async function uploadMultipart(
     const transport = url.protocol === 'https:' ? https : http;
 
     return new Promise((resolve, reject) => {
+        const file = createReadStream(archivePath);
         const req = transport.request(
             url,
             {
@@ -154,49 +197,85 @@ async function uploadMultipart(
                 let text = '';
                 res.setEncoding('utf8');
                 res.on('data', (chunk) => (text += chunk));
-                res.on('end', async () => {
+                res.on('error', (error) =>
+                    reject(unreachable(url.origin, error)),
+                );
+                res.on('end', () => {
                     if (res.statusCode >= 200 && res.statusCode < 300) {
-                        resolve(text === '' ? null : JSON.parse(text));
-                    } else {
-                        reject(await toApiError(res.statusCode, text));
+                        try {
+                            resolve(parseJson(text, res.statusCode));
+                        } catch (error) {
+                            reject(error);
+                        }
+
+                        return;
                     }
+
+                    // Refused, maybe before the whole archive went up, as
+                    // a proxy does over its size limit: stop sending.
+                    file.destroy();
+                    req.destroy();
+                    reject(toApiError(res.statusCode, text));
                 });
             },
         );
 
-        req.on('error', (error) =>
-            reject(
-                new Error(`Could not reach ${url.origin}: ${error.message}`),
-            ),
-        );
+        req.on('error', (error) => reject(unreachable(url.origin, error)));
 
         let sent = 0;
         req.write(head);
-        const file = createReadStream(archivePath);
         file.on('data', (chunk) => {
             sent += chunk.length;
             onProgress(sent, size);
         });
-        file.on('error', reject);
+        file.on('error', (error) => {
+            req.destroy();
+            reject(error);
+        });
         file.on('end', () => req.end(tail));
         file.pipe(req, { end: false });
     });
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** A failure that a later try may not repeat: the panel busy, down, or unreachable. */
+function isTransient(error) {
+    return (
+        error instanceof NetworkError ||
+        (error instanceof ApiError && error.transient)
+    );
+}
+
 /**
  * Follow a deployment until it finishes, handing each new piece of output
- * to onOutput. Resolves with the final deployment.
+ * to onOutput. A poll that fails for a passing reason is tried again, a
+ * little later each time, before giving up. Resolves with the final
+ * deployment.
  */
 export async function followDeployment(
     client,
     site,
     deployment,
-    { onOutput = () => {}, intervalMs = 2000, signal } = {},
+    { onOutput = () => {}, intervalMs = 2000, retries = 5 } = {},
 ) {
     let offset = 0;
+    let failures = 0;
 
     for (;;) {
-        const current = await client.deployment(site, deployment, offset);
+        let current;
+
+        try {
+            current = await client.deployment(site, deployment, offset);
+            failures = 0;
+        } catch (error) {
+            if (!isTransient(error) || ++failures > retries) {
+                throw error;
+            }
+
+            await sleep(intervalMs * failures);
+            continue;
+        }
 
         if (current.output) {
             onOutput(current.output);
@@ -206,14 +285,10 @@ export async function followDeployment(
             offset = current.offset;
         }
 
-        if (current.status === 'succeeded' || current.status === 'failed') {
+        if (!IN_PROGRESS.has(current.status)) {
             return current;
         }
 
-        if (signal?.aborted) {
-            return current;
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+        await sleep(intervalMs);
     }
 }
