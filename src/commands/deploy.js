@@ -1,7 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import { rm } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
-import { createClient, followDeployment } from '../api.js';
+import { rmSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { createClient, followDeployment, friendlyMessage } from '../api.js';
 import { PROJECT_FILE, readProject } from '../config.js';
 import { TYPE_LABELS } from '../detect.js';
 import {
@@ -25,8 +27,11 @@ with the website's deploy script and switches it live without downtime.
   HTML      uploads the publish directory as it is (skydun deploy ./dist),
             or the whole folder to build on the server.
 
-.gitignore and .skydunignore are respected. Archives are limited to
+.gitignore files and .skydunignore are respected. Archives are limited to
 ${formatBytes(MAX_ARCHIVE_BYTES)}.
+
+Exits 0 once the deployment succeeds, 1 when it fails or could not be
+followed to the end, and 2 for a usage error.
 
 Options:
   --site <uuid>      Deploy this website instead of the one in ${PROJECT_FILE}
@@ -65,12 +70,17 @@ export function gitMessage(cwd) {
 
 /**
  * Which folder to pack and how: an HTML website's publish directory goes
- * up as it is (prebuilt), anything else is the project's source.
+ * up as it is (prebuilt), unless it is the project folder itself, however
+ * that is spelled; anything else is the project's source.
  */
 export function resolveUpload(type, cwd, directoryArg, project) {
     const directory = directoryArg ?? project?.directory;
 
-    if (type === 'html' && directory && directory !== '.') {
+    if (
+        type === 'html' &&
+        directory &&
+        resolve(cwd, directory) !== resolve(cwd)
+    ) {
         return { root: resolve(cwd, directory), prebuilt: true };
     }
 
@@ -80,7 +90,12 @@ export function resolveUpload(type, cwd, directoryArg, project) {
     };
 }
 
-export async function deploy({ args, options, cwd = process.cwd() }) {
+export async function deploy({
+    args,
+    options,
+    cwd = process.cwd(),
+    pollIntervalMs,
+}) {
     const config = await requireLogin();
     const client = createClient(config);
     const project = await readProject(cwd);
@@ -119,12 +134,29 @@ export async function deploy({ args, options, cwd = process.cwd() }) {
         );
     }
 
-    console.log(
-        `Packing ${prebuilt ? root : 'the source'} for a ${TYPE_LABELS[type] ?? type} website…`,
-    );
-    const archive = await packArchive(root, type, { prebuilt });
+    // The archive gets a folder of its own, removed whatever happens,
+    // Ctrl-C included.
+    const folder = await mkdtemp(join(tmpdir(), 'skydun-'));
+    let phase = 'pack';
+    let deploymentUrl = null;
+
+    const onInterrupt = () => {
+        rmSync(folder, { recursive: true, force: true });
+        process.stdout.write('\n');
+        console.log(
+            phase === 'follow'
+                ? `Stopped following. The deployment keeps running on the server: ${deploymentUrl}`
+                : 'Cancelled. Nothing was deployed.',
+        );
+        process.exit(130);
+    };
+    process.once('SIGINT', onInterrupt);
 
     try {
+        console.log(
+            `Packing ${prebuilt ? root : 'the source'} for a ${TYPE_LABELS[type] ?? type} website…`,
+        );
+        const archive = await packArchive(root, type, { prebuilt, folder });
         console.log(
             `Packed ${archive.files} files (${formatBytes(archive.size)}).`,
         );
@@ -136,21 +168,13 @@ export async function deploy({ args, options, cwd = process.cwd() }) {
         }
 
         const message = options.message ?? gitMessage(root);
-        let phase = 'upload';
-        let deploymentUrl = null;
+        const isTty = Boolean(process.stdout.isTTY);
+        phase = 'upload';
 
-        const onInterrupt = () => {
-            process.stdout.write('\n');
-            console.log(
-                phase === 'upload'
-                    ? 'Upload cancelled. Nothing was deployed.'
-                    : `Stopped following. The deployment keeps running on the server: ${deploymentUrl}`,
-            );
-            process.exit(130);
-        };
-        process.once('SIGINT', onInterrupt);
+        if (!isTty) {
+            console.log(`Uploading ${formatBytes(archive.size)}…`);
+        }
 
-        const isTty = process.stdout.isTTY;
         const { deployment } = await client.deploy(
             siteUuid,
             archive.path,
@@ -159,12 +183,15 @@ export async function deploy({ args, options, cwd = process.cwd() }) {
                 prebuilt: type === 'html' ? (prebuilt ? '1' : '0') : undefined,
             },
             (sent, total) => {
-                if (isTty) {
-                    const percent = Math.floor((sent / total) * 100);
-                    process.stdout.write(
-                        `\rUploading… ${percent}% of ${formatBytes(total)}`,
-                    );
+                if (!isTty) {
+                    return;
                 }
+
+                process.stdout.write(
+                    sent < total
+                        ? `\rUploading… ${Math.floor((sent / total) * 100)}% of ${formatBytes(total)}`
+                        : `\rUploaded ${formatBytes(total)}. Waiting for the panel…`,
+                );
             },
         );
 
@@ -177,21 +204,29 @@ export async function deploy({ args, options, cwd = process.cwd() }) {
         console.log(`Deployment queued: ${deployment.url}`);
 
         if (options.wait === false) {
-            process.removeListener('SIGINT', onInterrupt);
-
             return 0;
         }
 
-        const finished = await followDeployment(
-            client,
-            siteUuid,
-            deployment.uuid,
-            {
-                onOutput: (chunk) => process.stdout.write(chunk),
-            },
-        );
+        let finished;
 
-        process.removeListener('SIGINT', onInterrupt);
+        try {
+            finished = await followDeployment(
+                client,
+                siteUuid,
+                deployment.uuid,
+                {
+                    onOutput: (chunk) => process.stdout.write(chunk),
+                    intervalMs: pollIntervalMs,
+                },
+            );
+        } catch (error) {
+            console.error(
+                `\nCould not follow the deployment to its end: ${friendlyMessage(error)}`,
+            );
+            console.error(`It keeps running on the server: ${deployment.url}`);
+
+            return 1;
+        }
 
         if (finished.status === 'succeeded') {
             console.log(`\nDeployed. ${finished.url ?? deployment.url}`);
@@ -206,6 +241,7 @@ export async function deploy({ args, options, cwd = process.cwd() }) {
 
         return 1;
     } finally {
-        await rm(dirname(archive.path), { recursive: true, force: true });
+        process.removeListener('SIGINT', onInterrupt);
+        await rm(folder, { recursive: true, force: true });
     }
 }

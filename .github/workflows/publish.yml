@@ -18,6 +18,14 @@ jobs:
           node-version: '22'
           registry-url: https://registry.npmjs.org
           cache: npm
+      - name: Check that package.json matches the release tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$version" ]; then
+            echo "package.json says $version but the release is $GITHUB_REF_NAME. Bump the version first."
+            exit 1
+          fi
       - run: npm ci
       - run: npm test
       - run: npm publish --provenance --access public

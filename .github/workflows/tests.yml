@@ -10,11 +10,15 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
     strategy:
       matrix:
+        os: [ubuntu-latest]
         node: ['20', '22', '24']
-    name: Node ${{ matrix.node }}
+        include:
+          - os: windows-latest
+            node: '22'
+    runs-on: ${{ matrix.os }}
+    name: Node ${{ matrix.node }} on ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -24,3 +28,15 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: node bin/skydun.js --version
+
+  format:
+    runs-on: ubuntu-latest
+    name: Formatting
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check

@@ -15,13 +15,21 @@ export function configPath(env = process.env) {
 }
 
 async function readJson(path) {
+    let text;
+
     try {
-        return JSON.parse(await readFile(path, 'utf8'));
+        text = await readFile(path, 'utf8');
     } catch (error) {
         if (error.code === 'ENOENT') {
             return null;
         }
 
+        throw new Error(`Could not read ${path}: ${error.message}`);
+    }
+
+    try {
+        return JSON.parse(text);
+    } catch (error) {
         throw new Error(`${path} is not valid JSON: ${error.message}`);
     }
 }

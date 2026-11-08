@@ -40,6 +40,7 @@ const COMMANDS = {
 };
 
 const VALUE_OPTIONS = new Set(['url', 'site', 'message']);
+const FLAG_OPTIONS = new Set(['help', 'version', 'wait']);
 
 export function version() {
     const pkg = JSON.parse(
@@ -67,7 +68,8 @@ In CI, set SKYDUN_URL and SKYDUN_TOKEN instead of logging in.`;
 
 /**
  * Split argv into the command, its positional arguments and its options:
- * --name value, --name=value, --flag and --no-flag.
+ * --name value, --name=value, --flag and --no-flag. An option no command
+ * has is refused, so a typo does not pass unnoticed.
  */
 export function parseArgs(argv) {
     const args = [];
@@ -83,20 +85,28 @@ export function parseArgs(argv) {
             options.version = true;
         } else if (arg.startsWith('--')) {
             const [rawName, inline] = arg.slice(2).split(/=(.*)/s, 2);
+            const negated = rawName.startsWith('no-');
+            const name = negated ? rawName.slice(3) : rawName;
 
-            if (rawName.startsWith('no-')) {
-                options[rawName.slice(3)] = false;
-            } else if (VALUE_OPTIONS.has(rawName)) {
+            if (!negated && VALUE_OPTIONS.has(name)) {
                 const value = inline ?? argv[++i];
 
                 if (value === undefined || value.startsWith('--')) {
-                    throw new Error(`--${rawName} needs a value.`);
+                    throw new Error(`--${name} needs a value.`);
                 }
 
-                options[rawName] = value;
+                options[name] = value;
+            } else if (FLAG_OPTIONS.has(name)) {
+                options[name] = !negated;
             } else {
-                options[rawName] = inline ?? true;
+                throw new Error(
+                    `Unknown option --${rawName}. Run skydun --help to see the options.`,
+                );
             }
+        } else if (arg.startsWith('-') && arg !== '-') {
+            throw new Error(
+                `Unknown option ${arg}. Options are spelled out, as in --site.`,
+            );
         } else if (command === null) {
             command = arg;
         } else {
@@ -107,7 +117,11 @@ export function parseArgs(argv) {
     return { command, args, options };
 }
 
-export async function main(argv) {
+/**
+ * Run the CLI with the given arguments and resolve with its exit code.
+ * The context, such as cwd, reaches the command alongside its arguments.
+ */
+export async function main(argv, context = {}) {
     let parsed;
 
     try {
@@ -147,7 +161,7 @@ export async function main(argv) {
     }
 
     try {
-        return (await entry.run({ args, options })) ?? 0;
+        return (await entry.run({ args, options, ...context })) ?? 0;
     } catch (error) {
         console.error(friendlyMessage(error));
 
