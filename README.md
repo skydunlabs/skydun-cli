@@ -85,3 +85,21 @@ Set `SKYDUN_URL` and `SKYDUN_TOKEN` instead of logging in. They take the place o
 ## Where the token is kept
 
 `$XDG_CONFIG_HOME/skydun/config.json`, or `~/.config/skydun/config.json`, readable only by you.
+
+## Development
+
+```bash
+git clone git@github.com:skydunlabs/skydun-cli.git
+cd skydun-cli
+npm ci
+npm test
+node bin/skydun.js --help
+```
+
+The CLI talks to a [skydun](https://github.com/skydunlabs/skydun) panel over its `/api/v1` routes. Against a local Herd panel, run Node with `--use-system-ca` so it trusts Herd's certificate.
+
+Releases are published to npm by the Publish workflow when a GitHub release is created.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -2,6 +2,22 @@
     "name": "skydun",
     "version": "0.1.0",
     "description": "Deploy Laravel, Next.js and HTML websites to skydun from your machine.",
+    "keywords": [
+        "skydun",
+        "deploy",
+        "laravel",
+        "nextjs",
+        "cli"
+    ],
+    "homepage": "https://github.com/skydunlabs/skydun-cli#readme",
+    "bugs": {
+        "url": "https://github.com/skydunlabs/skydun-cli/issues"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/skydunlabs/skydun-cli.git"
+    },
+    "license": "MIT",
     "type": "module",
     "bin": {
         "skydun": "bin/skydun.js"
@@ -9,7 +25,8 @@
     "files": [
         "bin",
         "src",
-        "README.md"
+        "README.md",
+        "LICENSE"
     ],
     "engines": {
         "node": ">=20"
@@ -20,6 +37,5 @@
     "dependencies": {
         "ignore": "^7.0.5",
         "tar": "^7.4.3"
-    },
-    "license": "MIT"
+    }
 }
